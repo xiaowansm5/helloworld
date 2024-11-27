@@ -9,13 +9,52 @@ require "luci.model.uci"
 local icount = 0
 local args = arg[1]
 local uci = luci.model.uci.cursor()
-local TMP_DNSMASQ_PATH = "/tmp/dnsmasq.d/dnsmasq-ssrplus.d"
+
+-- 以下设置更新数据库至 DNSMASQ 配置路径
+-- 获取 DNSMasq 配置 ID
+local DEFAULT_DNSMASQ_CFGID = uci:get_first("dhcp", "dnsmasq", ".name")
+
+if not DEFAULT_DNSMASQ_CFGID then
+    error("未找到默认的 DNSMasq 配置 ID")
+end
+
+-- 查找包含 conf-dir 选项的 dnsmasq.conf 文件路径
+local DNSMASQ_CONF_PATH_CMD = string.format("grep -l '^conf-dir=' /tmp/etc/dnsmasq.conf.%s*", DEFAULT_DNSMASQ_CFGID)
+local DNSMASQ_CONF_PATH = io.popen(DNSMASQ_CONF_PATH_CMD):read("*l")
+
+if not DNSMASQ_CONF_PATH or DNSMASQ_CONF_PATH:match("^%s*$") then
+    error("无法找到包含 conf-dir 选项的 dnsmasq.conf 文件路径")
+end
+
+DNSMASQ_CONF_PATH = DNSMASQ_CONF_PATH:gsub("%s+", "") -- 去除空白字符
+
+-- 获取 DNSMASQ 配置路径
+local DNSMASQ_CONF_DIR_CMD = string.format("grep '^conf-dir=' %s | cut -d'=' -f2 | head -n 1", DNSMASQ_CONF_PATH)
+local DNSMASQ_CONF_DIR = io.popen(DNSMASQ_CONF_DIR_CMD):read("*l")
+
+if not DNSMASQ_CONF_DIR or DNSMASQ_CONF_DIR:match("^%s*$") then
+    error("无法提取 conf-dir 配置，请检查 dnsmasq.conf 文件内容")
+end
+
+DNSMASQ_CONF_DIR = DNSMASQ_CONF_DIR:gsub("%s+", "") -- 去除空白字符
+
+-- 设置 dnsmasq-ssrplus.d 目录路径，并去除路径末尾的斜杠
+local TMP_DNSMASQ_PATH = DNSMASQ_CONF_DIR:match("^(.-)/?$") .. "/dnsmasq-ssrplus.d"
+
+if not TMP_DNSMASQ_PATH or TMP_DNSMASQ_PATH:match("^%s*$") then
+    error("无法找到包含 dnsmasq 选项的 dnsmasq-ssrplus.d 目录路径")
+end
+
 local TMP_PATH = "/var/etc/ssrplus"
 -- match comments/title/whitelist/ip address/excluded_domain
 local comment_pattern = "^[!\\[@]+"
 local ip_pattern = "^%d+%.%d+%.%d+%.%d+"
 local domain_pattern = "([%w%-%_]+%.[%w%.%-%_]+)[%/%*]*"
-local excluded_domain = {"apple.com", "sina.cn", "sina.com.cn", "baidu.com", "byr.cn", "jlike.com", "weibo.com", "zhongsou.com", "youdao.com", "sogou.com", "so.com", "soso.com", "aliyun.com", "taobao.com", "jd.com", "qq.com"}
+local excluded_domain = {
+    "apple.com", "sina.cn", "sina.com.cn", "baidu.com", "byr.cn", "jlike.com", 
+    "weibo.com", "zhongsou.com", "youdao.com", "sogou.com", "so.com", "soso.com", 
+    "aliyun.com", "taobao.com", "jd.com", "qq.com"
+}
 -- gfwlist parameter
 local mydnsip = '127.0.0.1'
 local mydnsport = '5335'
@@ -44,48 +83,50 @@ local function base64_dec(data)
 		return string.char(c)
 	end))
 end
--- check excluded domain
+-- check if domain is excluded
 local function check_excluded_domain(value)
-	for k, v in ipairs(excluded_domain) do
-		if value:find(v) then
+	for _, domain in ipairs(excluded_domain) do
+		if value:find(domain) then
 			return true
 		end
 	end
 end
 -- gfwlist转码至dnsmasq格式
 local function generate_gfwlist(type)
-	local domains = {}
-	local out = io.open("/tmp/ssr-update." .. type, "w")
-	for line in io.lines("/tmp/ssr-update.tmp") do
-		if not (string.find(line, comment_pattern) or string.find(line, ip_pattern) or check_excluded_domain(line)) then
-			local start, finish, match = string.find(line, domain_pattern)
-			if (start) then
-				domains[match] = true
-			end
-		end
-	end
-	for k, v in pairs(domains) do
-		out:write(string.format("server=/%s/%s#%s\n", k, mydnsip, mydnsport))
-		out:write(string.format("ipset=/%s/%s\n", k, ipsetname))
-	end
-	out:close()
-	os.remove("/tmp/ssr-update.tmp")
+    local domains, domains_map = {}, {}
+    local out = io.open("/tmp/ssr-update." .. type, "w")
+    for line in io.lines("/tmp/ssr-update.tmp") do
+        if not (string.find(line, comment_pattern) or string.find(line, ip_pattern) or check_excluded_domain(line)) then
+            local start, finish, match = string.find(line, domain_pattern)
+            if start and not domains_map[match] then
+                domains_map[match] = true
+                table.insert(domains, match)
+            end
+        end
+    end
+    for _, domain in ipairs(domains) do
+        out:write(string.format("server=/%s/%s#%s\n", domain, mydnsip, mydnsport))
+        out:write(string.format("ipset=/%s/%s\n", domain, ipsetname))
+    end
+    out:close()
+    os.remove("/tmp/ssr-update.tmp")
 end
 
 -- adblock转码至dnsmasq格式
 local function generate_adblock(type)
-	local domains = {}
+	local domains, domains_map = {}, {}
 	local out = io.open("/tmp/ssr-update." .. type, "w")
 	for line in io.lines("/tmp/ssr-update.tmp") do
 		if not (string.find(line, comment_pattern)) then
 			local start, finish, match = string.find(line, domain_pattern)
-			if (start) then
-				domains[match] = true
+			if start and not domains_map[match] then
+				domains_map[match] = true
+				table.insert(domains, match)
 			end
 		end
 	end
-	for k, v in pairs(domains) do
-		out:write(string.format("address=/%s/\n", k))
+	for _, domain in ipairs(domains) do
+		out:write(string.format("address=/%s/\n", domain))
 	end
 	out:close()
 	os.remove("/tmp/ssr-update.tmp")
@@ -154,7 +195,7 @@ local function update(url, file, type, file2)
 			if args then
 				log(0, tonumber(icount) / Num)
 			else
-				log("更新成功！ 新的总纪录数：" .. tostring(tonumber(icount) / Num))
+				log("更新成功！ 新的总记录数：" .. tostring(tonumber(icount) / Num))
 			end
 		end
 	else
